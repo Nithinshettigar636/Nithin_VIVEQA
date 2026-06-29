@@ -1,0 +1,1510 @@
+module data_entry(
+    input clk, sw_sel, sw_reset, btn_send, btn_exe,
+    input [9:0]  sw_digits,
+    input [1:0]  sw_pow10,
+    output reg [63:0] step_value,
+    output reg [63:0] delay_cycles,
+    output [63:0] current_value_out,   // NEW - for 7-seg display
+    output [2:0] leds);
+
+    reg [63:0] current_value = 0;
+    // REMOVED: calc_step and calc_delay (were never used)
+    reg btn_send_prev;
+    reg btn_exe_prev;
+    wire [3:0] active_digit;
+    reg  [63:0] math_constant_b;
+    reg  [63:0] math_constant_b_latched;
+    wire [127:0] math_result;
+    reg [4:0] wait_counter    = 0;
+    reg       is_calculating  = 0;
+    reg       target_is_delay = 0;
+
+    assign leds[1:0] = sw_pow10;
+    assign leds[2]   = sw_sel;
+
+    // NEW - expose current_value for display
+    assign current_value_out = current_value;
+
+    assign active_digit =
+    sw_digits[0] ? 4'd0 : sw_digits[1] ? 4'd1 : sw_digits[2] ? 4'd2 :
+    sw_digits[3] ? 4'd3 : sw_digits[4] ? 4'd4 : sw_digits[5] ? 4'd5 :
+    sw_digits[6] ? 4'd6 : sw_digits[7] ? 4'd7 : sw_digits[8] ? 4'd8 :
+    sw_digits[9] ? 4'd9 : 4'd0;
+
+    always @(*) begin
+        if (sw_sel == 1'b0) begin // FREQUENCY
+            // ------------------------------------------------
+            // Carrier frequency entry (user enters carrier Hz)
+            // FPGA divides by 9 internally (9 peaks per cycle)
+            // constant = 2^64   1024 / (9   100,000,000)
+            // ------------------------------------------------
+            case(sw_pow10)
+                2'b00: math_constant_b = 64'd20988295479421; // x10^(0)  ? 1 Hz/unit
+                2'b01: math_constant_b = 64'd2098829547942;  // x10^(-1) ? 0.1 Hz/unit
+                2'b10: math_constant_b = 64'd209882954794;   // x10^(-2) ? 0.01 Hz/unit
+                2'b11: math_constant_b = 64'd20988295479;    // x10^(-3) ? 0.001 Hz/unit
+                default: math_constant_b = 64'd20988295479421;
+            endcase
+        end else begin // DELAY
+            // ------------------------------------------------
+            // Seconds-based delay entry
+            // constant = clock_cycles per unit
+            // ------------------------------------------------
+            case(sw_pow10)
+                2'b00: math_constant_b = 64'd100000000; // x1      ? 1s/unit
+                2'b01: math_constant_b = 64'd10000000;  // x10^(-1)? 0.1s/unit
+                2'b10: math_constant_b = 64'd1000000;   // x10^(-2)? 0.01s/unit
+                2'b11: math_constant_b = 64'd100000;    // x10^(-3)? 1ms/unit
+                default: math_constant_b = 64'd100000000;
+            endcase
+        end
+    end
+
+
+    mult_gen_0 pipelined_multiplier (
+        .CLK  (clk),
+        .A    (current_value),
+        .B    (math_constant_b_latched),
+        .CE   (1'b1),
+        .SCLR (sw_reset),
+        .P    (math_result)
+    );
+
+    always @(posedge clk) begin
+        btn_send_prev <= btn_send;
+        btn_exe_prev  <= btn_exe;
+
+        if (sw_reset) begin
+            current_value           <= 0;
+            step_value              <= 0;
+            delay_cycles            <= 0;
+            is_calculating          <= 0;
+            wait_counter            <= 0;
+            math_constant_b_latched <= 0;
+        end else begin
+
+            if (!is_calculating) begin
+
+                if (btn_send && !btn_send_prev) begin
+                    current_value <= (current_value << 3) +
+                                     (current_value << 1) + active_digit;
+                end
+
+                if (btn_exe && !btn_exe_prev) begin
+                    is_calculating          <= 1;
+                    wait_counter            <= 0;
+                    target_is_delay         <= sw_sel;
+                    math_constant_b_latched <= math_constant_b;
+                end
+
+            end else begin
+
+                if (wait_counter < 18) begin
+                    wait_counter <= wait_counter + 1;
+                end else begin
+                    is_calculating <= 0;
+                    current_value  <= 0;
+                    if (target_is_delay == 1'b0)
+                        step_value   <= math_result[63:0];
+                    else
+                        delay_cycles <= math_result[63:0];
+                end
+
+            end
+        end
+    end
+endmodule
+
+
+module debouncer(
+input clk, btn_in,
+output reg btn_out);
+
+reg [19:0] counter = 0;
+
+reg sync_0 = 0;
+reg sync_1 = 0;
+
+always @(posedge clk) begin
+sync_0 <= btn_in;
+sync_1 <= sync_0;
+
+if(sync_1 == btn_out)
+    counter <= 0;
+else begin
+    counter <= counter + 1;
+    if(counter == 20'd1_000_000) begin
+        btn_out <= sync_1;
+        counter <= 0; end
+end
+end
+endmodule
+
+
+module delay_control(
+    input clk, tick, rst,
+    input [63:0] delay_cycles,
+    output reg [9:0] lut_address,
+    output reg enable);
+
+    localparam playing  = 1'b0;
+    localparam delaying = 1'b1;
+
+    reg state = playing;
+    reg [63:0] delay_counter = 64'd0;
+
+    initial begin
+        lut_address = 10'd0;
+        enable      = 1'b1;
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state         <= playing;
+            lut_address   <= 10'd0;
+            delay_counter <= 64'd0;
+            enable        <= 1'b1; end
+        else begin
+            case (state)
+                playing: begin
+                    enable <= 1'b1;
+                    if (tick) begin
+                        if (lut_address == 10'd1023) begin
+                            lut_address   <= 10'd0;
+                            state         <= delaying;
+                            delay_counter <= 64'd0;
+                            enable        <= 1'b0; end
+                        else begin
+                            lut_address <= lut_address + 10'd1; end
+                    end
+                end
+                delaying: begin
+                    enable <= 1'b0;
+                    if (delay_counter >= delay_cycles) begin
+                        state       <= playing;
+                        lut_address <= 10'd0;
+                        enable      <= 1'b1; end
+                    else begin
+                        delay_counter <= delay_counter + 64'd1; end
+                end
+            endcase
+        end
+    end
+endmodule
+
+
+module freq_divider(
+input clk, enable, rst,
+input [63:0] step_value,
+output reg tick);
+
+reg [63:0] accumulator = 64'd0;
+
+always@(posedge clk) begin
+if(rst) begin
+    accumulator <= 64'd0;
+    tick <= 1'b0; end
+else if(enable)
+    {tick, accumulator}  <= accumulator + step_value;
+else begin
+    accumulator <= 64'd0;
+    tick <= 1'b0;
+end
+end
+endmodule
+
+
+module pwm_out(
+    input clk,
+    input [7:0] data,
+    output reg pwm_out);
+    
+    reg [7:0] counter = 0;
+    
+    always @(posedge clk) begin
+        counter  <= counter + 1;
+        pwm_out  <= (counter < data) ? 1'b1 : 1'b0;
+    end
+endmodule
+
+
+module seg7_display (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [63:0] current_value,
+    input  wire [1:0]  sw_pow10,        // NEW - for decimal point position
+    output reg  [3:0]  D0_a,
+    output reg  [7:0]  D0_seg,
+    output reg  [3:0]  D1_a,
+    output reg  [7:0]  D1_seg
+);
+
+    reg [26:0] cv = 27'd0;
+    always @(posedge clk) begin
+        cv <= current_value[26:0];
+    end
+
+    wire [3:0] d0 =  cv                  % 10;
+    wire [3:0] d1 = (cv / 27'd10       ) % 10;
+    wire [3:0] d2 = (cv / 27'd100      ) % 10;
+    wire [3:0] d3 = (cv / 27'd1000     ) % 10;
+    wire [3:0] d4 = (cv / 27'd10000    ) % 10;
+    wire [3:0] d5 = (cv / 27'd100000   ) % 10;
+    wire [3:0] d6 = (cv / 27'd1000000  ) % 10;
+    wire [3:0] d7 = (cv / 27'd10000000 ) % 10;
+
+    wire blank0 = (current_value == 64'd0);
+    wire blank1 = (current_value <  64'd10);
+    wire blank2 = (current_value <  64'd100);
+    wire blank3 = (current_value <  64'd1000);
+    wire blank4 = (current_value <  64'd10000);
+    wire blank5 = (current_value <  64'd100000);
+    wire blank6 = (current_value <  64'd1000000);
+    wire blank7 = (current_value <  64'd10000000);
+
+    // ============================================================
+    // 7-Segment encoder
+    // seg[7] = decimal point - always 1 (OFF) from this function
+    // decimal point is set separately in the display driver below
+    // seg[6:0] = g f e d c b a  (active LOW)
+    // ============================================================
+    function [7:0] seg_encode;
+        input [3:0] digit;
+        input       blank;
+        begin
+            if (blank)
+                seg_encode = 8'b11111111;
+            else
+                case (digit)
+                    4'd0: seg_encode = 8'b11000000;
+                    4'd1: seg_encode = 8'b11111001;
+                    4'd2: seg_encode = 8'b10100100;
+                    4'd3: seg_encode = 8'b10110000;
+                    4'd4: seg_encode = 8'b10011001;
+                    4'd5: seg_encode = 8'b10010010;
+                    4'd6: seg_encode = 8'b10000010;
+                    4'd7: seg_encode = 8'b11111000;
+                    4'd8: seg_encode = 8'b10000000;
+                    4'd9: seg_encode = 8'b10010000;
+                    default: seg_encode = 8'b11111111;
+                endcase
+        end
+    endfunction
+
+    reg [13:0] prescaler = 14'd0;
+    reg [2:0]  digit_sel = 3'd0;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            prescaler <= 14'd0;
+            digit_sel <= 3'd0;
+        end else begin
+            if (prescaler == 14'd12499) begin
+                prescaler <= 14'd0;
+                digit_sel <= digit_sel + 3'd1;
+            end else begin
+                prescaler <= prescaler + 14'd1;
+            end
+        end
+    end
+
+    // ============================================================
+    // Display driver
+    //
+    // Decimal point positions (seg[7]=0 means ON, active LOW):
+    //   pow10=00 ? no decimal point
+    //   pow10=01 ? decimal on d1 ? digit_sel=6 (7th from left)
+    //   pow10=10 ? decimal on d2 ? digit_sel=5 (6th from left)
+    //   pow10=11 ? decimal on d3 ? digit_sel=4 (5th from left)
+    //
+    // For each relevant digit position:
+    //   seg[7:0] = { dp_bit, seg_encode[6:0] }
+    //   dp_bit = 0 (ON) if this position is the decimal point
+    //   dp_bit = 1 (OFF) otherwise
+    // ============================================================
+    reg [7:0] seg_temp;
+    
+    always @(posedge clk) begin
+        D1_a   <= 4'b1111;
+        D1_seg <= 8'b11111111;
+        D0_a   <= 4'b1111;
+        D0_seg <= 8'b11111111;
+    
+        case (digit_sel)
+            // Left display D1 - no decimal point ever on these positions
+            3'd0: begin D1_a <= 4'b0111; D1_seg <= seg_encode(d7, blank7); end
+            3'd1: begin D1_a <= 4'b1011; D1_seg <= seg_encode(d6, blank6); end
+            3'd2: begin D1_a <= 4'b1101; D1_seg <= seg_encode(d5, blank5); end
+            3'd3: begin D1_a <= 4'b1110; D1_seg <= seg_encode(d4, blank4); end
+    
+            // Right display D0 - decimal point possible on positions 4,5,6
+    
+            // digit_sel=4 ? d3 ? pow10=11 puts decimal here (5th from left)
+            3'd4: begin
+                D0_a   <= 4'b0111;
+                seg_temp = seg_encode(d3, blank3);
+                D0_seg <= {(sw_pow10 == 2'b11) ? 1'b0 : 1'b1, seg_temp[6:0]};
+            end
+    
+            // digit_sel=5 ? d2 ? pow10=10 puts decimal here (6th from left)
+            3'd5: begin
+                D0_a   <= 4'b1011;
+                seg_temp = seg_encode(d2, blank2);
+                D0_seg <= {(sw_pow10 == 2'b10) ? 1'b0 : 1'b1, seg_temp[6:0]};
+            end
+    
+            // digit_sel=6 ? d1 ? pow10=01 puts decimal here (7th from left)
+            3'd6: begin
+                D0_a   <= 4'b1101;
+                seg_temp = seg_encode(d1, blank1);
+                D0_seg <= {(sw_pow10 == 2'b01) ? 1'b0 : 1'b1, seg_temp[6:0]};
+            end
+    
+            // digit_sel=7 ? d0 ? rightmost digit, never has decimal
+            3'd7: begin
+                D0_a   <= 4'b1110;
+                D0_seg <= seg_encode(d0, blank0);
+            end
+        endcase
+    end
+
+endmodule
+
+
+module top (
+    input  wire clk,
+    input  wire [15:0] sw,
+    input  wire [3:0]  btn,
+    output wire [15:0] led,
+    output wire        wave_out,
+    output wire [3:0]  D0_a,
+    output wire [7:0]  D0_seg,
+    output wire [3:0]  D1_a,
+    output wire [7:0]  D1_seg
+        
+);
+    wire clean_send;
+    wire clean_exe;
+    wire [63:0] sys_step_value;
+    wire [63:0] sys_delay_cycles;
+    wire sys_tick;
+    wire sys_enable;
+    wire [9:0] sys_lut_address;
+    wire [7:0] lut_data;
+
+    wire raw_btn_send = btn[0]; 
+    wire raw_btn_exe  = btn[1]; 
+    wire [9:0] sw_digits = sw[9:0];
+    wire [1:0] sw_pow10  = sw[11:10];
+    wire       sw_reset  = sw[12];
+    wire       sw_sel    = sw[13];
+    wire [63:0] current_value_disp; // NEW - connects data_entry to display
+
+    
+    assign led[15:14] = 2'b00;
+    assign led[13]    = sw_sel;
+    assign led[12]    = 1'b0;
+    assign led[11:10] = sw_pow10;
+    assign led[9:0]   = 10'd0;
+
+    debouncer u_debounce_send (
+        .clk     (clk),
+        .btn_in  (raw_btn_send),
+        .btn_out (clean_send)
+    );
+    debouncer u_debounce_exe (
+        .clk     (clk),
+        .btn_in  (raw_btn_exe),
+        .btn_out (clean_exe)
+    );
+    // data_entry - ADD current_value_out connection
+    data_entry u_data_entry (
+        .clk              (clk),
+        .sw_sel           (sw_sel),
+        .sw_reset         (sw_reset),
+        .btn_send         (clean_send),
+        .btn_exe          (clean_exe),
+        .sw_digits        (sw_digits),
+        .sw_pow10         (sw_pow10),
+        .step_value       (sys_step_value),
+        .delay_cycles     (sys_delay_cycles),
+        .current_value_out(current_value_disp), // NEW
+        .leds             ()
+    );
+    
+    freq_divider u_freq_divider (
+        .clk        (clk),
+        .enable     (sys_enable),
+        .rst        (sw_reset),      
+        .step_value (sys_step_value),
+        .tick       (sys_tick)
+    );
+    delay_control u_delay_control (
+        .clk          (clk),
+        .tick         (sys_tick),
+        .rst          (sw_reset),    
+        .delay_cycles (sys_delay_cycles),
+        .lut_address  (sys_lut_address),
+        .enable       (sys_enable)
+    );
+    
+    seg7_display u_seg7_display (
+        .clk           (clk),
+        .rst           (sw_reset),
+        .current_value (current_value_disp),
+	.sw_pow10      (sw_pow10),
+        .D0_a          (D0_a),
+        .D0_seg        (D0_seg),
+        .D1_a          (D1_a),
+        .D1_seg        (D1_seg)
+    );
+    
+    waveform_lut u_waveform_lut (
+        .address (sys_lut_address),
+        .data    (lut_data) 
+    );
+    
+    pwm_out u_pwm_out (
+        .clk     (clk),
+        .data    (lut_data),
+        .pwm_out (wave_out)
+    );
+    
+endmodule
+
+
+
+module waveform_lut (
+    input  wire [9:0] address,
+    output reg  [7:0] data);
+    reg [7:0] lut [0:1023];
+    initial begin
+        lut[0] = 8'h00;
+        lut[1] = 8'h00;
+        lut[2] = 8'h00;
+        lut[3] = 8'h00;
+        lut[4] = 8'h00;
+        lut[5] = 8'h00;
+        lut[6] = 8'h00;
+        lut[7] = 8'h00;
+        lut[8] = 8'h00;
+        lut[9] = 8'h00;
+        lut[10] = 8'h00;
+        lut[11] = 8'h00;
+        lut[12] = 8'h00;
+        lut[13] = 8'h00;
+        lut[14] = 8'h00;
+        lut[15] = 8'h00;
+        lut[16] = 8'h00;
+        lut[17] = 8'h00;
+        lut[18] = 8'h00;
+        lut[19] = 8'h00;
+        lut[20] = 8'h00;
+        lut[21] = 8'h00;
+        lut[22] = 8'h00;
+        lut[23] = 8'h00;
+        lut[24] = 8'h01;
+        lut[25] = 8'h01;
+        lut[26] = 8'h01;
+        lut[27] = 8'h01;
+        lut[28] = 8'h01;
+        lut[29] = 8'h01;
+        lut[30] = 8'h01;
+        lut[31] = 8'h01;
+        lut[32] = 8'h01;
+        lut[33] = 8'h02;
+        lut[34] = 8'h02;
+        lut[35] = 8'h02;
+        lut[36] = 8'h02;
+        lut[37] = 8'h02;
+        lut[38] = 8'h03;
+        lut[39] = 8'h03;
+        lut[40] = 8'h03;
+        lut[41] = 8'h03;
+        lut[42] = 8'h04;
+        lut[43] = 8'h04;
+        lut[44] = 8'h04;
+        lut[45] = 8'h04;
+        lut[46] = 8'h05;
+        lut[47] = 8'h05;
+        lut[48] = 8'h05;
+        lut[49] = 8'h05;
+        lut[50] = 8'h06;
+        lut[51] = 8'h06;
+        lut[52] = 8'h06;
+        lut[53] = 8'h07;
+        lut[54] = 8'h07;
+        lut[55] = 8'h07;
+        lut[56] = 8'h07;
+        lut[57] = 8'h08;
+        lut[58] = 8'h08;
+        lut[59] = 8'h08;
+        lut[60] = 8'h08;
+        lut[61] = 8'h09;
+        lut[62] = 8'h09;
+        lut[63] = 8'h09;
+        lut[64] = 8'h09;
+        lut[65] = 8'h0A;
+        lut[66] = 8'h0A;
+        lut[67] = 8'h0A;
+        lut[68] = 8'h0A;
+        lut[69] = 8'h0A;
+        lut[70] = 8'h0A;
+        lut[71] = 8'h0A;
+        lut[72] = 8'h0A;
+        lut[73] = 8'h0A;
+        lut[74] = 8'h0A;
+        lut[75] = 8'h0A;
+        lut[76] = 8'h0A;
+        lut[77] = 8'h0A;
+        lut[78] = 8'h0A;
+        lut[79] = 8'h0A;
+        lut[80] = 8'h0A;
+        lut[81] = 8'h0A;
+        lut[82] = 8'h09;
+        lut[83] = 8'h09;
+        lut[84] = 8'h09;
+        lut[85] = 8'h09;
+        lut[86] = 8'h08;
+        lut[87] = 8'h08;
+        lut[88] = 8'h08;
+        lut[89] = 8'h07;
+        lut[90] = 8'h07;
+        lut[91] = 8'h07;
+        lut[92] = 8'h06;
+        lut[93] = 8'h06;
+        lut[94] = 8'h06;
+        lut[95] = 8'h05;
+        lut[96] = 8'h05;
+        lut[97] = 8'h04;
+        lut[98] = 8'h04;
+        lut[99] = 8'h04;
+        lut[100] = 8'h03;
+        lut[101] = 8'h03;
+        lut[102] = 8'h02;
+        lut[103] = 8'h02;
+        lut[104] = 8'h02;
+        lut[105] = 8'h01;
+        lut[106] = 8'h01;
+        lut[107] = 8'h01;
+        lut[108] = 8'h01;
+        lut[109] = 8'h00;
+        lut[110] = 8'h00;
+        lut[111] = 8'h00;
+        lut[112] = 8'h00;
+        lut[113] = 8'h00;
+        lut[114] = 8'h00;
+        lut[115] = 8'h00;
+        lut[116] = 8'h00;
+        lut[117] = 8'h00;
+        lut[118] = 8'h00;
+        lut[119] = 8'h01;
+        lut[120] = 8'h01;
+        lut[121] = 8'h01;
+        lut[122] = 8'h02;
+        lut[123] = 8'h02;
+        lut[124] = 8'h03;
+        lut[125] = 8'h03;
+        lut[126] = 8'h04;
+        lut[127] = 8'h05;
+        lut[128] = 8'h06;
+        lut[129] = 8'h06;
+        lut[130] = 8'h07;
+        lut[131] = 8'h08;
+        lut[132] = 8'h09;
+        lut[133] = 8'h0A;
+        lut[134] = 8'h0C;
+        lut[135] = 8'h0D;
+        lut[136] = 8'h0E;
+        lut[137] = 8'h0F;
+        lut[138] = 8'h11;
+        lut[139] = 8'h12;
+        lut[140] = 8'h14;
+        lut[141] = 8'h15;
+        lut[142] = 8'h17;
+        lut[143] = 8'h18;
+        lut[144] = 8'h1A;
+        lut[145] = 8'h1B;
+        lut[146] = 8'h1D;
+        lut[147] = 8'h1F;
+        lut[148] = 8'h20;
+        lut[149] = 8'h22;
+        lut[150] = 8'h24;
+        lut[151] = 8'h26;
+        lut[152] = 8'h27;
+        lut[153] = 8'h29;
+        lut[154] = 8'h2B;
+        lut[155] = 8'h2C;
+        lut[156] = 8'h2E;
+        lut[157] = 8'h30;
+        lut[158] = 8'h31;
+        lut[159] = 8'h33;
+        lut[160] = 8'h34;
+        lut[161] = 8'h36;
+        lut[162] = 8'h37;
+        lut[163] = 8'h38;
+        lut[164] = 8'h39;
+        lut[165] = 8'h3B;
+        lut[166] = 8'h3C;
+        lut[167] = 8'h3D;
+        lut[168] = 8'h3E;
+        lut[169] = 8'h3F;
+        lut[170] = 8'h3F;
+        lut[171] = 8'h40;
+        lut[172] = 8'h41;
+        lut[173] = 8'h41;
+        lut[174] = 8'h42;
+        lut[175] = 8'h42;
+        lut[176] = 8'h42;
+        lut[177] = 8'h42;
+        lut[178] = 8'h42;
+        lut[179] = 8'h42;
+        lut[180] = 8'h42;
+        lut[181] = 8'h41;
+        lut[182] = 8'h41;
+        lut[183] = 8'h40;
+        lut[184] = 8'h3F;
+        lut[185] = 8'h3F;
+        lut[186] = 8'h3E;
+        lut[187] = 8'h3D;
+        lut[188] = 8'h3C;
+        lut[189] = 8'h3A;
+        lut[190] = 8'h39;
+        lut[191] = 8'h38;
+        lut[192] = 8'h36;
+        lut[193] = 8'h35;
+        lut[194] = 8'h33;
+        lut[195] = 8'h31;
+        lut[196] = 8'h2F;
+        lut[197] = 8'h2E;
+        lut[198] = 8'h2C;
+        lut[199] = 8'h2A;
+        lut[200] = 8'h28;
+        lut[201] = 8'h26;
+        lut[202] = 8'h24;
+        lut[203] = 8'h22;
+        lut[204] = 8'h20;
+        lut[205] = 8'h1E;
+        lut[206] = 8'h1C;
+        lut[207] = 8'h1A;
+        lut[208] = 8'h18;
+        lut[209] = 8'h16;
+        lut[210] = 8'h14;
+        lut[211] = 8'h12;
+        lut[212] = 8'h10;
+        lut[213] = 8'h0E;
+        lut[214] = 8'h0C;
+        lut[215] = 8'h0B;
+        lut[216] = 8'h09;
+        lut[217] = 8'h08;
+        lut[218] = 8'h06;
+        lut[219] = 8'h05;
+        lut[220] = 8'h04;
+        lut[221] = 8'h03;
+        lut[222] = 8'h02;
+        lut[223] = 8'h01;
+        lut[224] = 8'h01;
+        lut[225] = 8'h00;
+        lut[226] = 8'h00;
+        lut[227] = 8'h00;
+        lut[228] = 8'h00;
+        lut[229] = 8'h00;
+        lut[230] = 8'h01;
+        lut[231] = 8'h01;
+        lut[232] = 8'h02;
+        lut[233] = 8'h03;
+        lut[234] = 8'h04;
+        lut[235] = 8'h05;
+        lut[236] = 8'h06;
+        lut[237] = 8'h08;
+        lut[238] = 8'h0A;
+        lut[239] = 8'h0B;
+        lut[240] = 8'h0E;
+        lut[241] = 8'h10;
+        lut[242] = 8'h12;
+        lut[243] = 8'h15;
+        lut[244] = 8'h17;
+        lut[245] = 8'h1A;
+        lut[246] = 8'h1D;
+        lut[247] = 8'h20;
+        lut[248] = 8'h23;
+        lut[249] = 8'h27;
+        lut[250] = 8'h2A;
+        lut[251] = 8'h2E;
+        lut[252] = 8'h31;
+        lut[253] = 8'h35;
+        lut[254] = 8'h39;
+        lut[255] = 8'h3D;
+        lut[256] = 8'h41;
+        lut[257] = 8'h45;
+        lut[258] = 8'h49;
+        lut[259] = 8'h4D;
+        lut[260] = 8'h51;
+        lut[261] = 8'h55;
+        lut[262] = 8'h59;
+        lut[263] = 8'h5D;
+        lut[264] = 8'h60;
+        lut[265] = 8'h64;
+        lut[266] = 8'h68;
+        lut[267] = 8'h6C;
+        lut[268] = 8'h6F;
+        lut[269] = 8'h73;
+        lut[270] = 8'h76;
+        lut[271] = 8'h7A;
+        lut[272] = 8'h7D;
+        lut[273] = 8'h80;
+        lut[274] = 8'h83;
+        lut[275] = 8'h86;
+        lut[276] = 8'h88;
+        lut[277] = 8'h8B;
+        lut[278] = 8'h8D;
+        lut[279] = 8'h8F;
+        lut[280] = 8'h90;
+        lut[281] = 8'h92;
+        lut[282] = 8'h93;
+        lut[283] = 8'h95;
+        lut[284] = 8'h96;
+        lut[285] = 8'h96;
+        lut[286] = 8'h97;
+        lut[287] = 8'h97;
+        lut[288] = 8'h97;
+        lut[289] = 8'h97;
+        lut[290] = 8'h96;
+        lut[291] = 8'h95;
+        lut[292] = 8'h94;
+        lut[293] = 8'h93;
+        lut[294] = 8'h92;
+        lut[295] = 8'h90;
+        lut[296] = 8'h8E;
+        lut[297] = 8'h8C;
+        lut[298] = 8'h8A;
+        lut[299] = 8'h87;
+        lut[300] = 8'h85;
+        lut[301] = 8'h82;
+        lut[302] = 8'h7F;
+        lut[303] = 8'h7B;
+        lut[304] = 8'h78;
+        lut[305] = 8'h74;
+        lut[306] = 8'h71;
+        lut[307] = 8'h6D;
+        lut[308] = 8'h69;
+        lut[309] = 8'h65;
+        lut[310] = 8'h61;
+        lut[311] = 8'h5C;
+        lut[312] = 8'h58;
+        lut[313] = 8'h54;
+        lut[314] = 8'h4F;
+        lut[315] = 8'h4B;
+        lut[316] = 8'h47;
+        lut[317] = 8'h42;
+        lut[318] = 8'h3E;
+        lut[319] = 8'h39;
+        lut[320] = 8'h35;
+        lut[321] = 8'h31;
+        lut[322] = 8'h2D;
+        lut[323] = 8'h29;
+        lut[324] = 8'h25;
+        lut[325] = 8'h21;
+        lut[326] = 8'h1D;
+        lut[327] = 8'h1A;
+        lut[328] = 8'h17;
+        lut[329] = 8'h13;
+        lut[330] = 8'h10;
+        lut[331] = 8'h0E;
+        lut[332] = 8'h0B;
+        lut[333] = 8'h09;
+        lut[334] = 8'h07;
+        lut[335] = 8'h05;
+        lut[336] = 8'h04;
+        lut[337] = 8'h02;
+        lut[338] = 8'h01;
+        lut[339] = 8'h01;
+        lut[340] = 8'h00;
+        lut[341] = 8'h00;
+        lut[342] = 8'h00;
+        lut[343] = 8'h01;
+        lut[344] = 8'h01;
+        lut[345] = 8'h02;
+        lut[346] = 8'h04;
+        lut[347] = 8'h05;
+        lut[348] = 8'h07;
+        lut[349] = 8'h09;
+        lut[350] = 8'h0C;
+        lut[351] = 8'h0F;
+        lut[352] = 8'h12;
+        lut[353] = 8'h15;
+        lut[354] = 8'h19;
+        lut[355] = 8'h1D;
+        lut[356] = 8'h21;
+        lut[357] = 8'h25;
+        lut[358] = 8'h29;
+        lut[359] = 8'h2E;
+        lut[360] = 8'h33;
+        lut[361] = 8'h38;
+        lut[362] = 8'h3E;
+        lut[363] = 8'h43;
+        lut[364] = 8'h49;
+        lut[365] = 8'h4E;
+        lut[366] = 8'h54;
+        lut[367] = 8'h5A;
+        lut[368] = 8'h60;
+        lut[369] = 8'h66;
+        lut[370] = 8'h6C;
+        lut[371] = 8'h72;
+        lut[372] = 8'h79;
+        lut[373] = 8'h7F;
+        lut[374] = 8'h85;
+        lut[375] = 8'h8B;
+        lut[376] = 8'h91;
+        lut[377] = 8'h96;
+        lut[378] = 8'h9C;
+        lut[379] = 8'hA2;
+        lut[380] = 8'hA7;
+        lut[381] = 8'hAD;
+        lut[382] = 8'hB2;
+        lut[383] = 8'hB7;
+        lut[384] = 8'hBC;
+        lut[385] = 8'hC0;
+        lut[386] = 8'hC4;
+        lut[387] = 8'hC8;
+        lut[388] = 8'hCC;
+        lut[389] = 8'hD0;
+        lut[390] = 8'hD3;
+        lut[391] = 8'hD6;
+        lut[392] = 8'hD8;
+        lut[393] = 8'hDB;
+        lut[394] = 8'hDD;
+        lut[395] = 8'hDE;
+        lut[396] = 8'hE0;
+        lut[397] = 8'hE1;
+        lut[398] = 8'hE1;
+        lut[399] = 8'hE2;
+        lut[400] = 8'hE1;
+        lut[401] = 8'hE1;
+        lut[402] = 8'hE0;
+        lut[403] = 8'hDF;
+        lut[404] = 8'hDE;
+        lut[405] = 8'hDC;
+        lut[406] = 8'hDA;
+        lut[407] = 8'hD7;
+        lut[408] = 8'hD4;
+        lut[409] = 8'hD1;
+        lut[410] = 8'hCE;
+        lut[411] = 8'hCA;
+        lut[412] = 8'hC6;
+        lut[413] = 8'hC2;
+        lut[414] = 8'hBD;
+        lut[415] = 8'hB9;
+        lut[416] = 8'hB4;
+        lut[417] = 8'hAE;
+        lut[418] = 8'hA9;
+        lut[419] = 8'hA3;
+        lut[420] = 8'h9E;
+        lut[421] = 8'h98;
+        lut[422] = 8'h92;
+        lut[423] = 8'h8B;
+        lut[424] = 8'h85;
+        lut[425] = 8'h7F;
+        lut[426] = 8'h79;
+        lut[427] = 8'h72;
+        lut[428] = 8'h6C;
+        lut[429] = 8'h65;
+        lut[430] = 8'h5F;
+        lut[431] = 8'h59;
+        lut[432] = 8'h53;
+        lut[433] = 8'h4C;
+        lut[434] = 8'h46;
+        lut[435] = 8'h41;
+        lut[436] = 8'h3B;
+        lut[437] = 8'h35;
+        lut[438] = 8'h30;
+        lut[439] = 8'h2B;
+        lut[440] = 8'h26;
+        lut[441] = 8'h21;
+        lut[442] = 8'h1D;
+        lut[443] = 8'h18;
+        lut[444] = 8'h15;
+        lut[445] = 8'h11;
+        lut[446] = 8'h0E;
+        lut[447] = 8'h0B;
+        lut[448] = 8'h08;
+        lut[449] = 8'h06;
+        lut[450] = 8'h04;
+        lut[451] = 8'h03;
+        lut[452] = 8'h01;
+        lut[453] = 8'h01;
+        lut[454] = 8'h00;
+        lut[455] = 8'h00;
+        lut[456] = 8'h00;
+        lut[457] = 8'h01;
+        lut[458] = 8'h02;
+        lut[459] = 8'h04;
+        lut[460] = 8'h05;
+        lut[461] = 8'h08;
+        lut[462] = 8'h0A;
+        lut[463] = 8'h0D;
+        lut[464] = 8'h10;
+        lut[465] = 8'h14;
+        lut[466] = 8'h18;
+        lut[467] = 8'h1C;
+        lut[468] = 8'h21;
+        lut[469] = 8'h25;
+        lut[470] = 8'h2A;
+        lut[471] = 8'h30;
+        lut[472] = 8'h35;
+        lut[473] = 8'h3B;
+        lut[474] = 8'h41;
+        lut[475] = 8'h48;
+        lut[476] = 8'h4E;
+        lut[477] = 8'h54;
+        lut[478] = 8'h5B;
+        lut[479] = 8'h62;
+        lut[480] = 8'h69;
+        lut[481] = 8'h70;
+        lut[482] = 8'h77;
+        lut[483] = 8'h7E;
+        lut[484] = 8'h85;
+        lut[485] = 8'h8C;
+        lut[486] = 8'h93;
+        lut[487] = 8'h9A;
+        lut[488] = 8'hA1;
+        lut[489] = 8'hA8;
+        lut[490] = 8'hAE;
+        lut[491] = 8'hB5;
+        lut[492] = 8'hBB;
+        lut[493] = 8'hC1;
+        lut[494] = 8'hC7;
+        lut[495] = 8'hCD;
+        lut[496] = 8'hD3;
+        lut[497] = 8'hD8;
+        lut[498] = 8'hDD;
+        lut[499] = 8'hE1;
+        lut[500] = 8'hE6;
+        lut[501] = 8'hEA;
+        lut[502] = 8'hEE;
+        lut[503] = 8'hF1;
+        lut[504] = 8'hF4;
+        lut[505] = 8'hF7;
+        lut[506] = 8'hF9;
+        lut[507] = 8'hFB;
+        lut[508] = 8'hFD;
+        lut[509] = 8'hFE;
+        lut[510] = 8'hFF;
+        lut[511] = 8'hFF;
+        lut[512] = 8'hFF;
+        lut[513] = 8'hFF;
+        lut[514] = 8'hFE;
+        lut[515] = 8'hFD;
+        lut[516] = 8'hFB;
+        lut[517] = 8'hF9;
+        lut[518] = 8'hF7;
+        lut[519] = 8'hF4;
+        lut[520] = 8'hF1;
+        lut[521] = 8'hEE;
+        lut[522] = 8'hEA;
+        lut[523] = 8'hE6;
+        lut[524] = 8'hE1;
+        lut[525] = 8'hDD;
+        lut[526] = 8'hD8;
+        lut[527] = 8'hD3;
+        lut[528] = 8'hCD;
+        lut[529] = 8'hC7;
+        lut[530] = 8'hC1;
+        lut[531] = 8'hBB;
+        lut[532] = 8'hB5;
+        lut[533] = 8'hAE;
+        lut[534] = 8'hA8;
+        lut[535] = 8'hA1;
+        lut[536] = 8'h9A;
+        lut[537] = 8'h93;
+        lut[538] = 8'h8C;
+        lut[539] = 8'h85;
+        lut[540] = 8'h7E;
+        lut[541] = 8'h77;
+        lut[542] = 8'h70;
+        lut[543] = 8'h69;
+        lut[544] = 8'h62;
+        lut[545] = 8'h5B;
+        lut[546] = 8'h54;
+        lut[547] = 8'h4E;
+        lut[548] = 8'h48;
+        lut[549] = 8'h41;
+        lut[550] = 8'h3B;
+        lut[551] = 8'h35;
+        lut[552] = 8'h30;
+        lut[553] = 8'h2A;
+        lut[554] = 8'h25;
+        lut[555] = 8'h21;
+        lut[556] = 8'h1C;
+        lut[557] = 8'h18;
+        lut[558] = 8'h14;
+        lut[559] = 8'h10;
+        lut[560] = 8'h0D;
+        lut[561] = 8'h0A;
+        lut[562] = 8'h08;
+        lut[563] = 8'h05;
+        lut[564] = 8'h04;
+        lut[565] = 8'h02;
+        lut[566] = 8'h01;
+        lut[567] = 8'h00;
+        lut[568] = 8'h00;
+        lut[569] = 8'h00;
+        lut[570] = 8'h01;
+        lut[571] = 8'h01;
+        lut[572] = 8'h03;
+        lut[573] = 8'h04;
+        lut[574] = 8'h06;
+        lut[575] = 8'h08;
+        lut[576] = 8'h0B;
+        lut[577] = 8'h0E;
+        lut[578] = 8'h11;
+        lut[579] = 8'h15;
+        lut[580] = 8'h18;
+        lut[581] = 8'h1D;
+        lut[582] = 8'h21;
+        lut[583] = 8'h26;
+        lut[584] = 8'h2B;
+        lut[585] = 8'h30;
+        lut[586] = 8'h35;
+        lut[587] = 8'h3B;
+        lut[588] = 8'h41;
+        lut[589] = 8'h46;
+        lut[590] = 8'h4C;
+        lut[591] = 8'h53;
+        lut[592] = 8'h59;
+        lut[593] = 8'h5F;
+        lut[594] = 8'h65;
+        lut[595] = 8'h6C;
+        lut[596] = 8'h72;
+        lut[597] = 8'h79;
+        lut[598] = 8'h7F;
+        lut[599] = 8'h85;
+        lut[600] = 8'h8B;
+        lut[601] = 8'h92;
+        lut[602] = 8'h98;
+        lut[603] = 8'h9E;
+        lut[604] = 8'hA3;
+        lut[605] = 8'hA9;
+        lut[606] = 8'hAE;
+        lut[607] = 8'hB4;
+        lut[608] = 8'hB9;
+        lut[609] = 8'hBD;
+        lut[610] = 8'hC2;
+        lut[611] = 8'hC6;
+        lut[612] = 8'hCA;
+        lut[613] = 8'hCE;
+        lut[614] = 8'hD1;
+        lut[615] = 8'hD4;
+        lut[616] = 8'hD7;
+        lut[617] = 8'hDA;
+        lut[618] = 8'hDC;
+        lut[619] = 8'hDE;
+        lut[620] = 8'hDF;
+        lut[621] = 8'hE0;
+        lut[622] = 8'hE1;
+        lut[623] = 8'hE1;
+        lut[624] = 8'hE2;
+        lut[625] = 8'hE1;
+        lut[626] = 8'hE1;
+        lut[627] = 8'hE0;
+        lut[628] = 8'hDE;
+        lut[629] = 8'hDD;
+        lut[630] = 8'hDB;
+        lut[631] = 8'hD8;
+        lut[632] = 8'hD6;
+        lut[633] = 8'hD3;
+        lut[634] = 8'hD0;
+        lut[635] = 8'hCC;
+        lut[636] = 8'hC8;
+        lut[637] = 8'hC4;
+        lut[638] = 8'hC0;
+        lut[639] = 8'hBC;
+        lut[640] = 8'hB7;
+        lut[641] = 8'hB2;
+        lut[642] = 8'hAD;
+        lut[643] = 8'hA7;
+        lut[644] = 8'hA2;
+        lut[645] = 8'h9C;
+        lut[646] = 8'h96;
+        lut[647] = 8'h91;
+        lut[648] = 8'h8B;
+        lut[649] = 8'h85;
+        lut[650] = 8'h7F;
+        lut[651] = 8'h79;
+        lut[652] = 8'h72;
+        lut[653] = 8'h6C;
+        lut[654] = 8'h66;
+        lut[655] = 8'h60;
+        lut[656] = 8'h5A;
+        lut[657] = 8'h54;
+        lut[658] = 8'h4E;
+        lut[659] = 8'h49;
+        lut[660] = 8'h43;
+        lut[661] = 8'h3E;
+        lut[662] = 8'h38;
+        lut[663] = 8'h33;
+        lut[664] = 8'h2E;
+        lut[665] = 8'h29;
+        lut[666] = 8'h25;
+        lut[667] = 8'h21;
+        lut[668] = 8'h1D;
+        lut[669] = 8'h19;
+        lut[670] = 8'h15;
+        lut[671] = 8'h12;
+        lut[672] = 8'h0F;
+        lut[673] = 8'h0C;
+        lut[674] = 8'h09;
+        lut[675] = 8'h07;
+        lut[676] = 8'h05;
+        lut[677] = 8'h04;
+        lut[678] = 8'h02;
+        lut[679] = 8'h01;
+        lut[680] = 8'h01;
+        lut[681] = 8'h00;
+        lut[682] = 8'h00;
+        lut[683] = 8'h00;
+        lut[684] = 8'h01;
+        lut[685] = 8'h01;
+        lut[686] = 8'h02;
+        lut[687] = 8'h04;
+        lut[688] = 8'h05;
+        lut[689] = 8'h07;
+        lut[690] = 8'h09;
+        lut[691] = 8'h0B;
+        lut[692] = 8'h0E;
+        lut[693] = 8'h10;
+        lut[694] = 8'h13;
+        lut[695] = 8'h17;
+        lut[696] = 8'h1A;
+        lut[697] = 8'h1D;
+        lut[698] = 8'h21;
+        lut[699] = 8'h25;
+        lut[700] = 8'h29;
+        lut[701] = 8'h2D;
+        lut[702] = 8'h31;
+        lut[703] = 8'h35;
+        lut[704] = 8'h39;
+        lut[705] = 8'h3E;
+        lut[706] = 8'h42;
+        lut[707] = 8'h47;
+        lut[708] = 8'h4B;
+        lut[709] = 8'h4F;
+        lut[710] = 8'h54;
+        lut[711] = 8'h58;
+        lut[712] = 8'h5C;
+        lut[713] = 8'h61;
+        lut[714] = 8'h65;
+        lut[715] = 8'h69;
+        lut[716] = 8'h6D;
+        lut[717] = 8'h71;
+        lut[718] = 8'h74;
+        lut[719] = 8'h78;
+        lut[720] = 8'h7B;
+        lut[721] = 8'h7F;
+        lut[722] = 8'h82;
+        lut[723] = 8'h85;
+        lut[724] = 8'h87;
+        lut[725] = 8'h8A;
+        lut[726] = 8'h8C;
+        lut[727] = 8'h8E;
+        lut[728] = 8'h90;
+        lut[729] = 8'h92;
+        lut[730] = 8'h93;
+        lut[731] = 8'h94;
+        lut[732] = 8'h95;
+        lut[733] = 8'h96;
+        lut[734] = 8'h97;
+        lut[735] = 8'h97;
+        lut[736] = 8'h97;
+        lut[737] = 8'h97;
+        lut[738] = 8'h96;
+        lut[739] = 8'h96;
+        lut[740] = 8'h95;
+        lut[741] = 8'h93;
+        lut[742] = 8'h92;
+        lut[743] = 8'h90;
+        lut[744] = 8'h8F;
+        lut[745] = 8'h8D;
+        lut[746] = 8'h8B;
+        lut[747] = 8'h88;
+        lut[748] = 8'h86;
+        lut[749] = 8'h83;
+        lut[750] = 8'h80;
+        lut[751] = 8'h7D;
+        lut[752] = 8'h7A;
+        lut[753] = 8'h76;
+        lut[754] = 8'h73;
+        lut[755] = 8'h6F;
+        lut[756] = 8'h6C;
+        lut[757] = 8'h68;
+        lut[758] = 8'h64;
+        lut[759] = 8'h60;
+        lut[760] = 8'h5D;
+        lut[761] = 8'h59;
+        lut[762] = 8'h55;
+        lut[763] = 8'h51;
+        lut[764] = 8'h4D;
+        lut[765] = 8'h49;
+        lut[766] = 8'h45;
+        lut[767] = 8'h41;
+        lut[768] = 8'h3D;
+        lut[769] = 8'h39;
+        lut[770] = 8'h35;
+        lut[771] = 8'h31;
+        lut[772] = 8'h2E;
+        lut[773] = 8'h2A;
+        lut[774] = 8'h27;
+        lut[775] = 8'h23;
+        lut[776] = 8'h20;
+        lut[777] = 8'h1D;
+        lut[778] = 8'h1A;
+        lut[779] = 8'h17;
+        lut[780] = 8'h15;
+        lut[781] = 8'h12;
+        lut[782] = 8'h10;
+        lut[783] = 8'h0E;
+        lut[784] = 8'h0B;
+        lut[785] = 8'h0A;
+        lut[786] = 8'h08;
+        lut[787] = 8'h06;
+        lut[788] = 8'h05;
+        lut[789] = 8'h04;
+        lut[790] = 8'h03;
+        lut[791] = 8'h02;
+        lut[792] = 8'h01;
+        lut[793] = 8'h01;
+        lut[794] = 8'h00;
+        lut[795] = 8'h00;
+        lut[796] = 8'h00;
+        lut[797] = 8'h00;
+        lut[798] = 8'h00;
+        lut[799] = 8'h01;
+        lut[800] = 8'h01;
+        lut[801] = 8'h02;
+        lut[802] = 8'h03;
+        lut[803] = 8'h04;
+        lut[804] = 8'h05;
+        lut[805] = 8'h06;
+        lut[806] = 8'h08;
+        lut[807] = 8'h09;
+        lut[808] = 8'h0B;
+        lut[809] = 8'h0C;
+        lut[810] = 8'h0E;
+        lut[811] = 8'h10;
+        lut[812] = 8'h12;
+        lut[813] = 8'h14;
+        lut[814] = 8'h16;
+        lut[815] = 8'h18;
+        lut[816] = 8'h1A;
+        lut[817] = 8'h1C;
+        lut[818] = 8'h1E;
+        lut[819] = 8'h20;
+        lut[820] = 8'h22;
+        lut[821] = 8'h24;
+        lut[822] = 8'h26;
+        lut[823] = 8'h28;
+        lut[824] = 8'h2A;
+        lut[825] = 8'h2C;
+        lut[826] = 8'h2E;
+        lut[827] = 8'h2F;
+        lut[828] = 8'h31;
+        lut[829] = 8'h33;
+        lut[830] = 8'h35;
+        lut[831] = 8'h36;
+        lut[832] = 8'h38;
+        lut[833] = 8'h39;
+        lut[834] = 8'h3A;
+        lut[835] = 8'h3C;
+        lut[836] = 8'h3D;
+        lut[837] = 8'h3E;
+        lut[838] = 8'h3F;
+        lut[839] = 8'h3F;
+        lut[840] = 8'h40;
+        lut[841] = 8'h41;
+        lut[842] = 8'h41;
+        lut[843] = 8'h42;
+        lut[844] = 8'h42;
+        lut[845] = 8'h42;
+        lut[846] = 8'h42;
+        lut[847] = 8'h42;
+        lut[848] = 8'h42;
+        lut[849] = 8'h42;
+        lut[850] = 8'h41;
+        lut[851] = 8'h41;
+        lut[852] = 8'h40;
+        lut[853] = 8'h3F;
+        lut[854] = 8'h3F;
+        lut[855] = 8'h3E;
+        lut[856] = 8'h3D;
+        lut[857] = 8'h3C;
+        lut[858] = 8'h3B;
+        lut[859] = 8'h39;
+        lut[860] = 8'h38;
+        lut[861] = 8'h37;
+        lut[862] = 8'h36;
+        lut[863] = 8'h34;
+        lut[864] = 8'h33;
+        lut[865] = 8'h31;
+        lut[866] = 8'h30;
+        lut[867] = 8'h2E;
+        lut[868] = 8'h2C;
+        lut[869] = 8'h2B;
+        lut[870] = 8'h29;
+        lut[871] = 8'h27;
+        lut[872] = 8'h26;
+        lut[873] = 8'h24;
+        lut[874] = 8'h22;
+        lut[875] = 8'h20;
+        lut[876] = 8'h1F;
+        lut[877] = 8'h1D;
+        lut[878] = 8'h1B;
+        lut[879] = 8'h1A;
+        lut[880] = 8'h18;
+        lut[881] = 8'h17;
+        lut[882] = 8'h15;
+        lut[883] = 8'h14;
+        lut[884] = 8'h12;
+        lut[885] = 8'h11;
+        lut[886] = 8'h0F;
+        lut[887] = 8'h0E;
+        lut[888] = 8'h0D;
+        lut[889] = 8'h0C;
+        lut[890] = 8'h0A;
+        lut[891] = 8'h09;
+        lut[892] = 8'h08;
+        lut[893] = 8'h07;
+        lut[894] = 8'h06;
+        lut[895] = 8'h06;
+        lut[896] = 8'h05;
+        lut[897] = 8'h04;
+        lut[898] = 8'h03;
+        lut[899] = 8'h03;
+        lut[900] = 8'h02;
+        lut[901] = 8'h02;
+        lut[902] = 8'h01;
+        lut[903] = 8'h01;
+        lut[904] = 8'h01;
+        lut[905] = 8'h00;
+        lut[906] = 8'h00;
+        lut[907] = 8'h00;
+        lut[908] = 8'h00;
+        lut[909] = 8'h00;
+        lut[910] = 8'h00;
+        lut[911] = 8'h00;
+        lut[912] = 8'h00;
+        lut[913] = 8'h00;
+        lut[914] = 8'h00;
+        lut[915] = 8'h01;
+        lut[916] = 8'h01;
+        lut[917] = 8'h01;
+        lut[918] = 8'h01;
+        lut[919] = 8'h02;
+        lut[920] = 8'h02;
+        lut[921] = 8'h02;
+        lut[922] = 8'h03;
+        lut[923] = 8'h03;
+        lut[924] = 8'h04;
+        lut[925] = 8'h04;
+        lut[926] = 8'h04;
+        lut[927] = 8'h05;
+        lut[928] = 8'h05;
+        lut[929] = 8'h06;
+        lut[930] = 8'h06;
+        lut[931] = 8'h06;
+        lut[932] = 8'h07;
+        lut[933] = 8'h07;
+        lut[934] = 8'h07;
+        lut[935] = 8'h08;
+        lut[936] = 8'h08;
+        lut[937] = 8'h08;
+        lut[938] = 8'h09;
+        lut[939] = 8'h09;
+        lut[940] = 8'h09;
+        lut[941] = 8'h09;
+        lut[942] = 8'h0A;
+        lut[943] = 8'h0A;
+        lut[944] = 8'h0A;
+        lut[945] = 8'h0A;
+        lut[946] = 8'h0A;
+        lut[947] = 8'h0A;
+        lut[948] = 8'h0A;
+        lut[949] = 8'h0A;
+        lut[950] = 8'h0A;
+        lut[951] = 8'h0A;
+        lut[952] = 8'h0A;
+        lut[953] = 8'h0A;
+        lut[954] = 8'h0A;
+        lut[955] = 8'h0A;
+        lut[956] = 8'h0A;
+        lut[957] = 8'h0A;
+        lut[958] = 8'h0A;
+        lut[959] = 8'h09;
+        lut[960] = 8'h09;
+        lut[961] = 8'h09;
+        lut[962] = 8'h09;
+        lut[963] = 8'h08;
+        lut[964] = 8'h08;
+        lut[965] = 8'h08;
+        lut[966] = 8'h08;
+        lut[967] = 8'h07;
+        lut[968] = 8'h07;
+        lut[969] = 8'h07;
+        lut[970] = 8'h07;
+        lut[971] = 8'h06;
+        lut[972] = 8'h06;
+        lut[973] = 8'h06;
+        lut[974] = 8'h05;
+        lut[975] = 8'h05;
+        lut[976] = 8'h05;
+        lut[977] = 8'h05;
+        lut[978] = 8'h04;
+        lut[979] = 8'h04;
+        lut[980] = 8'h04;
+        lut[981] = 8'h04;
+        lut[982] = 8'h03;
+        lut[983] = 8'h03;
+        lut[984] = 8'h03;
+        lut[985] = 8'h03;
+        lut[986] = 8'h02;
+        lut[987] = 8'h02;
+        lut[988] = 8'h02;
+        lut[989] = 8'h02;
+        lut[990] = 8'h02;
+        lut[991] = 8'h01;
+        lut[992] = 8'h01;
+        lut[993] = 8'h01;
+        lut[994] = 8'h01;
+        lut[995] = 8'h01;
+        lut[996] = 8'h01;
+        lut[997] = 8'h01;
+        lut[998] = 8'h01;
+        lut[999] = 8'h01;
+        lut[1000] = 8'h00;
+        lut[1001] = 8'h00;
+        lut[1002] = 8'h00;
+        lut[1003] = 8'h00;
+        lut[1004] = 8'h00;
+        lut[1005] = 8'h00;
+        lut[1006] = 8'h00;
+        lut[1007] = 8'h00;
+        lut[1008] = 8'h00;
+        lut[1009] = 8'h00;
+        lut[1010] = 8'h00;
+        lut[1011] = 8'h00;
+        lut[1012] = 8'h00;
+        lut[1013] = 8'h00;
+        lut[1014] = 8'h00;
+        lut[1015] = 8'h00;
+        lut[1016] = 8'h00;
+        lut[1017] = 8'h00;
+        lut[1018] = 8'h00;
+        lut[1019] = 8'h00;
+        lut[1020] = 8'h00;
+        lut[1021] = 8'h00;
+        lut[1022] = 8'h00;
+        lut[1023] = 8'h00;
+    end
+    always @(*) data = lut[address];
+endmodule
+
+
